@@ -45,8 +45,14 @@
 
     NSURL *_outputURL;
 
-    CMTime _audioTimestamp;
-    CMTime _videoTimestamp;
+    CMTime _endAudioTimestamp;
+    CMTime _endVideoTimestamp;
+    CMTime _startTimestamp;
+
+    bool _waitingForVideoData;
+    bool _waitingForAudioData;
+    
+    void (^_completionHandler)(void);
 }
 
 @end
@@ -55,8 +61,8 @@
 
 @synthesize delegate = _delegate;
 @synthesize outputURL = _outputURL;
-@synthesize audioTimestamp = _audioTimestamp;
-@synthesize videoTimestamp = _videoTimestamp;
+@synthesize audioTimestamp = _endAudioTimestamp;
+@synthesize videoTimestamp = _endVideoTimestamp;
 
 #pragma mark - getters/setters
 
@@ -104,9 +110,13 @@
         _assetWriter.shouldOptimizeForNetworkUse = YES;
         _assetWriter.metadata = [self _metadataArray];
 
-        _audioTimestamp = kCMTimeInvalid;
-        _videoTimestamp = kCMTimeInvalid;
+        _endAudioTimestamp = kCMTimeInvalid;
+        _endVideoTimestamp = kCMTimeInvalid;
+        _startTimestamp = kCMTimeInvalid;
 
+        _waitingForAudioData = NO;
+        _waitingForVideoData = NO;
+        
         // ensure authorization is permitted, if not already prompted
         // it's possible to capture video without audio or audio without video
         if ([[AVCaptureDevice class] respondsToSelector:@selector(authorizationStatusForMediaType:)]) {
@@ -234,26 +244,22 @@
     return self.isVideoReady;
 }
 
-#pragma mark - sample buffer writing
+-(void)startWriting {
+    // setup the writer
+    if (self->_assetWriter.status == AVAssetWriterStatusUnknown ) {
+        if ([self->_assetWriter startWriting]) {
+            DLog(@"started writing with status (%ld)", (long)_assetWriter.status);
+        } else {
+            DLog(@"error when starting to write (%@)", [_assetWriter error]);
+        }
+    }
+}
 
+#pragma mark - sample buffer writing
 - (void)writeSampleBuffer:(CMSampleBufferRef)sampleBuffer withMediaTypeVideo:(BOOL)video
 {
     if (!CMSampleBufferDataIsReady(sampleBuffer)) {
         return;
-    }
-
-    // setup the writer
-    if ( _assetWriter.status == AVAssetWriterStatusUnknown ) {
-
-        if ([_assetWriter startWriting]) {
-            CMTime timestamp = CMSampleBufferGetPresentationTimeStamp(sampleBuffer);
-            [_assetWriter startSessionAtSourceTime:timestamp];
-            DLog(@"started writing with status (%ld)", (long)_assetWriter.status);
-        } else {
-            DLog(@"error when starting to write (%@)", [_assetWriter error]);
-            return;
-        }
-
     }
 
     // check for completion state
@@ -281,38 +287,85 @@
             timestamp = CMTimeAdd(timestamp, duration);
         }
 
-        if (video) {
-            if (_assetWriterVideoInput.readyForMoreMediaData) {
+        if (video && !_waitingForAudioData) {
+            if (_assetWriterVideoInput.readyForMoreMediaData && CMTIME_IS_VALID(_startTimestamp)) {
                 if ([_assetWriterVideoInput appendSampleBuffer:sampleBuffer]) {
-                    _videoTimestamp = timestamp;
+                    _endVideoTimestamp = timestamp;
                 } else {
                     DLog(@"writer error appending video (%@)", _assetWriter.error);
                 }
             }
-        } else {
+        } else if (!video && !_waitingForVideoData) {
+            if (!CMTIME_IS_VALID(_startTimestamp)) {
+                [_assetWriter startSessionAtSourceTime:timestamp];
+                _startTimestamp = timestamp;
+            }
+            
             if (_assetWriterAudioInput.readyForMoreMediaData) {
                 if ([_assetWriterAudioInput appendSampleBuffer:sampleBuffer]) {
-                    _audioTimestamp = timestamp;
+                    _endAudioTimestamp = timestamp;
                 } else {
                     DLog(@"writer error appending audio (%@)", _assetWriter.error);
                 }
             }
         }
-
+        
+        if (_waitingForAudioData && !video && !isnan(CMTimeGetSeconds(_endAudioTimestamp)) && CMTimeCompare(_endAudioTimestamp, _endVideoTimestamp) >= 0) {
+            _waitingForAudioData = NO;
+            [self finishWritingWithCompletionHandler:_completionHandler];
+        } else if (_waitingForVideoData && video && !isnan(CMTimeGetSeconds(_endVideoTimestamp)) && CMTimeCompare(_endVideoTimestamp, _endAudioTimestamp) >= 0) {
+            _waitingForVideoData = NO;
+            [self finishWritingWithCompletionHandler:_completionHandler];
+        }
     }
 }
 
-- (void)finishWritingWithCompletionHandler:(void (^)(void))handler
+-(BOOL)validationTimeStampsWithCompletionHandler:(void (^)(void))handler {
+    Float64 videoSeconds = CMTimeGetSeconds(_endVideoTimestamp);
+    Float64 audioSeconds = CMTimeGetSeconds(_endAudioTimestamp);
+    if (isnan(videoSeconds)) {
+        _waitingForVideoData = YES;
+        return NO;
+    } else if (isnan(audioSeconds)) {
+        _waitingForAudioData = YES;
+        return NO;
+    }
+    Float64 diffSeconds = videoSeconds - audioSeconds;
+    if (fabs(diffSeconds) > 0.4) {
+        if (CMTimeCompare(_endVideoTimestamp, _endAudioTimestamp) == 1) {
+            _waitingForAudioData = YES;
+        } else {
+            _waitingForVideoData = YES;
+        }
+        _completionHandler = handler;
+        return NO;
+    }
+    return YES;
+}
+
+- (BOOL)finishWritingWithCompletionHandler:(void (^)(void))handler
 {
     if (_assetWriter.status == AVAssetWriterStatusUnknown ||
         _assetWriter.status == AVAssetWriterStatusCompleted) {
         DLog(@"asset writer was in an unexpected state (%@)", @(_assetWriter.status));
-        return;
+        return NO;
     }
-    [_assetWriterVideoInput markAsFinished];
-    [_assetWriterAudioInput markAsFinished];
+    CMTime timestamp;
+    if (CMTimeCompare(_endVideoTimestamp, _endAudioTimestamp) == 1) {
+        timestamp = _endVideoTimestamp;
+    } else {
+        timestamp = _endAudioTimestamp;
+    }
+    Float64 seconds = CMTimeGetSeconds(timestamp) - CMTimeGetSeconds(_startTimestamp);
+    if (fabs(seconds) <= 0 || isnan(seconds)) {
+        return NO;
+    } else {
+        [_assetWriterVideoInput markAsFinished];
+        [_assetWriterAudioInput markAsFinished];
+        [_assetWriter endSessionAtSourceTime:timestamp];
+    }
     [_assetWriter finishWritingWithCompletionHandler:handler];
+    return YES;
 }
-
 
 @end

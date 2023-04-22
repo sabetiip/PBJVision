@@ -44,7 +44,7 @@
 
 NSString * const PBJVisionErrorDomain = @"PBJVisionErrorDomain";
 
-static uint64_t const PBJVisionRequiredMinimumDiskSpaceInBytes = 49999872; // ~ 47 MB
+static uint64_t const PBJVisionRequiredMinimumDiskSpaceInBytes = 1024 * 1024; // * 512 * 1024
 static CGFloat const PBJVisionThumbnailWidth = 160.0f;
 
 // KVO contexts
@@ -170,6 +170,7 @@ typedef NS_ENUM(GLint, PBJVisionUniformLocationTypes)
     
     CIContext *_ciContext;
     
+    BOOL _needImageFromVideoSampleBuffer;
     // flags
     
     struct {
@@ -671,7 +672,7 @@ typedef NS_ENUM(GLint, PBJVisionUniformLocationTypes)
         }
         [self _setupGL];
         
-        _captureSessionPreset = AVCaptureSessionPresetMedium;
+        _captureSessionPreset = AVCaptureSessionPresetHigh;
         _captureDirectory = nil;
 
         _autoUpdatePreviewOrientation = YES;
@@ -698,6 +699,7 @@ typedef NS_ENUM(GLint, PBJVisionUniformLocationTypes)
         _previewLayer = [[AVCaptureVideoPreviewLayer alloc] init];
         
         _maximumCaptureDuration = kCMTimeInvalid;
+        _needImageFromVideoSampleBuffer = NO;
 
         [self setMirroringMode:PBJMirroringAuto];
 
@@ -1197,13 +1199,13 @@ typedef void (^PBJVisionBlock)(void);
 }
 
 - (void)stopPreview
-{    
+{
     [self _enqueueBlockOnCaptureSessionQueue:^{
         if (!self->_flags.previewRunning)
             return;
 
-        if (self->_previewLayer)
-            self->_previewLayer.connection.enabled = NO;
+//        if (self->_previewLayer)
+//            self->_previewLayer.connection.enabled = NO;
 
         if ([self->_captureSession isRunning])
             [self->_captureSession stopRunning];
@@ -1425,7 +1427,7 @@ typedef void (^PBJVisionBlock)(void);
             if ([previewConnection isVideoMirroringSupported]) {
                 [previewConnection setAutomaticallyAdjustsVideoMirroring:NO];
                 [previewConnection setVideoMirrored:NO];
-            }            
+            }
             break;
         }
         case PBJMirroringOn:
@@ -1436,7 +1438,7 @@ typedef void (^PBJVisionBlock)(void);
             if ([previewConnection isVideoMirroringSupported]) {
                 [previewConnection setAutomaticallyAdjustsVideoMirroring:NO];
                 [previewConnection setVideoMirrored:YES];
-            }            
+            }
             break;
         }
         case PBJMirroringAuto:
@@ -1699,6 +1701,10 @@ typedef void (^PBJVisionBlock)(void);
     [_captureOutputPhoto capturePhotoWithSettings:settings delegate:self];
 }
 
+- (void)capturePhotoWhileRecording {
+    _needImageFromVideoSampleBuffer = YES;
+}
+
 #pragma mark - video
 
 - (BOOL)supportsVideoCapture
@@ -1728,7 +1734,7 @@ typedef void (^PBJVisionBlock)(void);
             return;
     
         NSString *guid = [[NSUUID new] UUIDString];
-        NSString *outputFile = [NSString stringWithFormat:@"video_%@.mp4", guid];
+        NSString *outputFile = [NSString stringWithFormat:@"video_%@.mov", guid];
         
         if ([self->_delegate respondsToSelector:@selector(vision:willStartVideoCaptureToFile:)]) {
             outputFile = [self->_delegate vision:self willStartVideoCaptureToFile:outputFile];
@@ -1784,7 +1790,7 @@ typedef void (^PBJVisionBlock)(void);
             [self captureVideoThumbnailAtFrame:0];
         }
         
-        [self _enqueueBlockOnMainQueue:^{                
+        [self _enqueueBlockOnMainQueue:^{
             if ([self->_delegate respondsToSelector:@selector(visionDidStartVideoCapture:)])
                 [self->_delegate visionDidStartVideoCapture:self];
         }];
@@ -1811,7 +1817,7 @@ typedef void (^PBJVisionBlock)(void);
             if ([self->_delegate respondsToSelector:@selector(visionDidPauseVideoCapture:)])
                 [self->_delegate visionDidPauseVideoCapture:self];
         }];
-    }];    
+    }];
 }
 
 - (void)resumeVideoCapture
@@ -1833,11 +1839,11 @@ typedef void (^PBJVisionBlock)(void);
             if ([self->_delegate respondsToSelector:@selector(visionDidResumeVideoCapture:)])
                 [self->_delegate visionDidResumeVideoCapture:self];
         }];
-    }];    
+    }];
 }
 
 - (void)endVideoCapture
-{    
+{
     DLog(@"ending video capture");
     
     [self _enqueueBlockOnCaptureVideoQueue:^{
@@ -1849,10 +1855,10 @@ typedef void (^PBJVisionBlock)(void);
             return;
         }
         
-        self->_flags.recording = NO;
-        self->_flags.paused = NO;
-        
         void (^finishWritingCompletionHandler)(void) = ^{
+            self->_flags.recording = NO;
+            self->_flags.paused = NO;
+            
             Float64 capturedDuration = self.capturedVideoSeconds;
             
             self->_timeOffset = kCMTimeInvalid;
@@ -1860,8 +1866,6 @@ typedef void (^PBJVisionBlock)(void);
             self->_flags.interrupted = NO;
 
             [self _enqueueBlockOnMainQueue:^{
-                if ([self->_delegate respondsToSelector:@selector(visionDidEndVideoCapture:)])
-                    [self->_delegate visionDidEndVideoCapture:self];
 
                 NSMutableDictionary *videoDict = [[NSMutableDictionary alloc] init];
                 NSString *path = [self->_mediaWriter.outputURL path];
@@ -1885,7 +1889,10 @@ typedef void (^PBJVisionBlock)(void);
                 }
             }];
         };
-        [self->_mediaWriter finishWritingWithCompletionHandler:finishWritingCompletionHandler];
+        if (![self->_mediaWriter validationTimeStampsWithCompletionHandler:finishWritingCompletionHandler]) {
+            if ([self->_delegate respondsToSelector:@selector(visionDidEndVideoCapture:)])
+                [self->_delegate visionDidEndVideoCapture:self];
+        }
     }];
 }
 
@@ -2054,8 +2061,9 @@ typedef void (^PBJVisionBlock)(void);
         }
         case PBJOutputFormatWidescreen:
         {
-            videoDimensions.width = dimensions.width;
-            videoDimensions.height = (int32_t)(dimensions.width * 9 / 16.0f);
+            int32_t min = MIN(dimensions.width, dimensions.height);
+            videoDimensions.width = (int32_t)(min * 9 / 16.0f);
+            videoDimensions.height = min;
             break;
         }
         case PBJOutputFormatStandard:
@@ -2069,23 +2077,11 @@ typedef void (^PBJVisionBlock)(void);
             break;
     }
     
-    NSDictionary *compressionSettings = nil;
-    
-    if (_additionalCompressionProperties && [_additionalCompressionProperties count] > 0) {
-        NSMutableDictionary *mutableDictionary = [NSMutableDictionary dictionaryWithDictionary:_additionalCompressionProperties];
-        mutableDictionary[AVVideoAverageBitRateKey] = @(_videoBitRate);
-        mutableDictionary[AVVideoMaxKeyFrameIntervalKey] = @(_videoFrameRate);
-        compressionSettings = mutableDictionary;
-    } else {
-        compressionSettings = @{ AVVideoAverageBitRateKey : @(_videoBitRate),
-                                 AVVideoMaxKeyFrameIntervalKey : @(_videoFrameRate) };
-    }
-    
     NSDictionary *videoSettings = @{ AVVideoCodecKey : AVVideoCodecH264,
                                      AVVideoScalingModeKey : AVVideoScalingModeResizeAspectFill,
                                      AVVideoWidthKey : @(videoDimensions.width),
                                      AVVideoHeightKey : @(videoDimensions.height),
-                                     AVVideoCompressionPropertiesKey : compressionSettings };
+    };
 
 
     return [_mediaWriter setupVideoWithSettings:videoSettings withAdditional:[self additionalVideoProperties]];
@@ -2136,6 +2132,63 @@ previewPhotoSampleBuffer:(CMSampleBufferRef)previewPhotoSampleBuffer
 
 #pragma mark - AVCaptureAudioDataOutputSampleBufferDelegate, AVCaptureVideoDataOutputSampleBufferDelegate
 
+#define clamp(a) (uint8_t)(a > 255 ? 255 : (a < 0 ? 0 : a))
+- (UIImage *)imageFromSampleBuffer:(CMSampleBufferRef)sampleBuffer
+{
+//    CVImageBufferRef imageBuffer = CMSampleBufferGetImageBuffer(sampleBuffer);
+//    CVPixelBufferLockBaseAddress(imageBuffer,0);
+//
+//    size_t width = CVPixelBufferGetWidth(imageBuffer);
+//    size_t height = CVPixelBufferGetHeight(imageBuffer);
+//    uint8_t *yBuffer = CVPixelBufferGetBaseAddressOfPlane(imageBuffer, 0);
+//    size_t yPitch = CVPixelBufferGetBytesPerRowOfPlane(imageBuffer, 0);
+//    uint8_t *cbCrBuffer = CVPixelBufferGetBaseAddressOfPlane(imageBuffer, 1);
+//    size_t cbCrPitch = CVPixelBufferGetBytesPerRowOfPlane(imageBuffer, 1);
+//
+//    int bytesPerPixel = 4;
+//    uint8_t *rgbBuffer = malloc(width * height * bytesPerPixel);
+//
+//    for (size_t y = 0; y < height; y++)
+//    {
+//        uint8_t *rgbBufferLine = &rgbBuffer[y * width * bytesPerPixel];
+//        uint8_t *yBufferLine = &yBuffer[y * yPitch];
+//        uint8_t *cbCrBufferLine = &cbCrBuffer[(y >> 1) * cbCrPitch];
+//
+//        for (size_t x = 0; x < width; x++)
+//        {
+//            int16_t y = yBufferLine[x];
+//            int16_t cb = cbCrBufferLine[x & ~1] - 128;
+//            int16_t cr = cbCrBufferLine[x | 1] - 128;
+//
+//            uint8_t *rgbOutput = &rgbBufferLine[x * bytesPerPixel];
+//
+//            int16_t r = (int16_t)round( y + cr *  1.4 );
+//            int16_t g = (int16_t)round( y + cb * -0.343 + cr * -0.711 );
+//            int16_t b = (int16_t)round( y + cb *  1.765);
+//
+//            rgbOutput[0] = 0xff;
+//            rgbOutput[1] = clamp(b);
+//            rgbOutput[2] = clamp(g);
+//            rgbOutput[3] = clamp(r);
+//        }
+//    }
+//
+//    CGColorSpaceRef colorSpace = CGColorSpaceCreateDeviceRGB();
+//    CGContextRef context = CGBitmapContextCreate(rgbBuffer, width, height, 8, width * bytesPerPixel, colorSpace, kCGBitmapByteOrder32Little | kCGImageAlphaNoneSkipLast);
+//    CGImageRef quartzImage = CGBitmapContextCreateImage(context);
+//    UIImage *image = [UIImage imageWithCGImage:quartzImage];
+//
+//    CGContextRelease(context);
+//    CGColorSpaceRelease(colorSpace);
+//    CGImageRelease(quartzImage);
+//    free(rgbBuffer);
+//
+//    CVPixelBufferUnlockBaseAddress(imageBuffer, 0);
+//
+//    return image;
+    return [[UIImage alloc] init];
+}
+
 - (void)captureOutput:(AVCaptureOutput *)captureOutput didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer fromConnection:(AVCaptureConnection *)connection
 {
     CFRetain(sampleBuffer);
@@ -2171,6 +2224,8 @@ previewPhotoSampleBuffer:(CMSampleBufferRef)previewPhotoSampleBuffer
     if (!isReadyToRecord) {
         CFRelease(sampleBuffer);
         return;
+    } else {
+        [_mediaWriter startWriting];
     }
     
     CMTime currentTimestamp = CMSampleBufferGetPresentationTimeStamp(sampleBuffer);
@@ -2212,7 +2267,15 @@ previewPhotoSampleBuffer:(CMSampleBufferRef)previewPhotoSampleBuffer
     if (bufferToWrite && !_flags.interrupted) {
     
         if (isVideo) {
-
+            if (_needImageFromVideoSampleBuffer && CMTIME_IS_VALID(_mediaWriter.videoTimestamp)) {
+                _needImageFromVideoSampleBuffer = NO;
+                UIImage *image = [self imageFromSampleBuffer:sampleBuffer];
+                [self _enqueueBlockOnMainQueue:^{
+                    if ([self->_delegate respondsToSelector:@selector(vision:capturePhotoWhileRecording:)]) {
+                        [self->_delegate vision:self capturePhotoWhileRecording:image];
+                    }
+                }];
+            }
             [_mediaWriter writeSampleBuffer:bufferToWrite withMediaTypeVideo:isVideo];
 
             _flags.videoWritten = YES;
@@ -2598,7 +2661,7 @@ previewPhotoSampleBuffer:(CMSampleBufferRef)previewPhotoSampleBuffer
     
     glBindTexture(CVOpenGLESTextureGetTarget(_lumaTexture), CVOpenGLESTextureGetName(_lumaTexture));
     glTexParameterf(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-    glTexParameterf(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE); 
+    glTexParameterf(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
     
     // UV-plane
     glActiveTexture(GL_TEXTURE1);
@@ -2634,7 +2697,7 @@ previewPhotoSampleBuffer:(CMSampleBufferRef)previewPhotoSampleBuffer
 
     if (_lumaTexture) {
         CFRelease(_lumaTexture);
-        _lumaTexture = NULL;        
+        _lumaTexture = NULL;
     }
     
     if (_chromaTexture) {

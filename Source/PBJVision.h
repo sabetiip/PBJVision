@@ -213,7 +213,7 @@ static CGFloat const PBJVideoBitRate1280x750 = 5000000 * 8;
 
 @property (nonatomic, readonly) BOOL canCapturePhoto;
 - (void)capturePhoto;
-
+- (void)capturePhotoWhileRecording;
 // video
 // use pause/resume if a session is in progress, end finalizes that recording session
 
@@ -304,6 +304,7 @@ static CGFloat const PBJVideoBitRate1280x750 = 5000000 * 8;
 - (void)visionWillCapturePhoto:(PBJVision *)vision;
 - (void)visionDidCapturePhoto:(PBJVision *)vision;
 - (void)vision:(PBJVision *)vision capturedPhoto:(nullable NSDictionary *)photoDict error:(nullable NSError *)error;
+- (void)vision:(PBJVision *)vision capturePhotoWhileRecording:(nullable UIImage *)image;
 
 // video
 
@@ -312,6 +313,7 @@ static CGFloat const PBJVideoBitRate1280x750 = 5000000 * 8;
 - (void)visionDidPauseVideoCapture:(PBJVision *)vision; // stopped but not ended
 - (void)visionDidResumeVideoCapture:(PBJVision *)vision;
 - (void)visionDidEndVideoCapture:(PBJVision *)vision;
+- (void)visionCancelVideoCapture:(PBJVision *)vision;
 - (void)vision:(PBJVision *)vision capturedVideo:(nullable NSDictionary *)videoDict error:(nullable NSError *)error;
 
 // video capture progress
